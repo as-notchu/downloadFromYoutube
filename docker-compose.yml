@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: downloadfy-backend
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - download-data:/app
+    restart: unless-stopped
+    networks:
+      - downloadfy-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: downloadfy-frontend
+    ports:
+      - "1010:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - downloadfy-network
+
+volumes:
+  download-data:
+
+networks:
+  downloadfy-network:
+    driver: bridge
