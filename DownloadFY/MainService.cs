@@ -197,17 +197,6 @@ public class MainService
 
         _logger.LogInformation("Found {Count} videos in playlist {PlaylistId}", videos.Count, playlistId);
 
-        var currentDownloadCount = Interlocked.Increment(ref _downloadCount);
-        
-        if (currentDownloadCount >= 25)
-        {
-            _logger.LogInformation("Rate limit reached ({Count} downloads), waiting 120 seconds", currentDownloadCount);
-            
-            await Task.Delay(TimeSpan.FromSeconds(120));
-            
-            Interlocked.Exchange(ref _downloadCount, 0);
-        }
-
         var fileCounter = new Dictionary<string, int>();
 
         foreach (var video in videos)
@@ -255,7 +244,14 @@ public class MainService
             try
             {
                 await _youtubeClient.Videos.Streams.DownloadAsync(stream, path);
-                Interlocked.Increment(ref _downloadCount);
+                var currentDownloadCount = Interlocked.Increment(ref _downloadCount);
+                
+                if (currentDownloadCount >= 25)
+                {
+                    _logger.LogInformation("Rate limit reached ({Count} downloads), waiting 120 seconds", currentDownloadCount);
+                    await Task.Delay(TimeSpan.FromSeconds(120));
+                    Interlocked.Exchange(ref _downloadCount, 0);
+                }
             }
             catch (Exception ex)
             {
