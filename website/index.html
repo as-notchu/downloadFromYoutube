@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DownloadFY - YouTube Playlist Downloader</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 0.95em;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            color: #555;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 100px;
+            transition: border-color 0.3s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+
+        .status.info {
+            background: #e3f2fd;
+            color: #1976d2;
+            border: 1px solid #90caf9;
+        }
+
+        .status.success {
+            background: #e8f5e9;
+            color: #388e3c;
+            border: 1px solid #81c784;
+        }
+
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ef9a9a;
+        }
+
+        .status.processing {
+            background: #fff3e0;
+            color: #e65100;
+            border: 1px solid #ffb74d;
+        }
+
+        .download-btn {
+            margin-top: 15px;
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .help-text {
+            font-size: 0.85em;
+            color: #888;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 DownloadFY</h1>
+        <p class="subtitle">Download YouTube playlists easily</p>
+
+        <div class="input-group">
+            <label for="urls">YouTube Playlist URLs</label>
+            <textarea 
+                id="urls" 
+                placeholder="Enter YouTube playlist URLs separated by spaces&#10;Example: https://youtube.com/playlist?list=... https://youtube.com/playlist?list=..."></textarea>
+            <div class="help-text">Maximum 10 playlists, separated by spaces</div>
+        </div>
+
+        <button id="submitBtn" onclick="submitUrls()">Submit</button>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        let currentTaskId = null;
+        let pollInterval = null;
+
+        // Check for existing task on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedTaskId = localStorage.getItem('currentTaskId');
+            if (savedTaskId) {
+                currentTaskId = savedTaskId;
+                showStatus('info', `<span class="spinner"></span>Resuming task ${savedTaskId}...<br>Checking status...`);
+                startPolling();
+            }
+        });
+
+        async function submitUrls() {
+            const urlsText = document.getElementById('urls').value.trim();
+            const statusDiv = document.getElementById('status');
+            const submitBtn = document.getElementById('submitBtn');
+
+            if (!urlsText) {
+                showStatus('error', 'Please enter at least one YouTube playlist URL');
+                return;
+            }
+
+            const urls = urlsText.split(' ').filter(url => url.trim());
+
+            if (urls.length === 0) {
+                showStatus('error', 'Please enter valid URLs');
+                return;
+            }
+
+            if (urls.length > 10) {
+                showStatus('error', 'Maximum 10 playlists allowed');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            showStatus('info', '<span class="spinner"></span>Submitting request...');
+
+            try {
+                const response = await fetch('/api/do-smth', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ values: urls })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to submit request');
+                }
+
+                currentTaskId = data.taskId;
+                localStorage.setItem('currentTaskId', data.taskId);
+                showStatus('info', `<span class="spinner"></span>Task queued! Position: ${data.queuePosition}<br>Task ID: ${data.taskId}<br>Checking status...`);
+                
+                startPolling();
+
+            } catch (error) {
+                showStatus('error', `Error: ${error.message}`);
+                submitBtn.disabled = false;
+            }
+        }
+
+        function startPolling() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+            }
+
+            pollInterval = setInterval(() => checkDownloadStatus(), 1000);
+        }
+
+        async function checkDownloadStatus() {
+            if (!currentTaskId) return;
+
+            try {
+                const response = await fetch(`/api/data/${currentTaskId}/download`, {
+                    method: 'GET'
+                });
+
+                if (response.status === 200) {
+                    clearInterval(pollInterval);
+                    localStorage.removeItem('currentTaskId');
+                    showStatus('success', `✓ Download ready!<br><button class="download-btn" onclick="downloadFile('${currentTaskId}')">Download ZIP</button>`);
+                    document.getElementById('submitBtn').disabled = false;
+                } else if (response.status === 400) {
+                    const data = await response.json();
+                    showStatus('processing', `<span class="spinner"></span>Processing... Status: ${data.currentStatus || 'working'}`);
+                } else if (response.status === 404) {
+                    clearInterval(pollInterval);
+                    localStorage.removeItem('currentTaskId');
+                    showStatus('error', 'Task not found or expired');
+                    document.getElementById('submitBtn').disabled = false;
+                    currentTaskId = null;
+                }
+            } catch (error) {
+                console.error('Polling error:', error);
+            }
+        }
+
+        async function downloadFile(taskId) {
+            try {
+                const url = `/api/data/${taskId}/download`;
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${taskId}.zip`;
+                
+                const response = await fetch(url);
+                
+                if (!response.ok) throw new Error('Download failed');
+                
+                const blob = await response.blob();
+                const objectUrl = URL.createObjectURL(blob);
+                a.href = objectUrl;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(objectUrl);
+                
+                localStorage.removeItem('currentTaskId');
+                showStatus('success', '✓ Download started! You can submit a new request.');
+            } catch (error) {
+                showStatus('error', `Download error: ${error.message}`);
+            }
+        }
+
+        function showStatus(type, message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = `status ${type}`;
+            statusDiv.innerHTML = message;
+            statusDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>

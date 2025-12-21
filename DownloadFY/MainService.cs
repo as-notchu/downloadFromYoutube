@@ -1,0 +1,395 @@
+﻿using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
+using YoutubeExplode;
+using YoutubeExplode.Common;
+using YoutubeExplode.Videos.Streams;
+
+namespace DownloadFY;
+
+public class MainService
+{
+    private readonly SemaphoreSlim _semaphore = new(1, 1);
+    private readonly Channel<QueueItem> _queue = Channel.CreateUnbounded<QueueItem>();
+    private readonly ILogger<MainService> _logger;
+    private int _queuedCount = 0;
+    private readonly YoutubeClient _youtubeClient;
+    private readonly Dictionary<Guid, TaskResult> _taskResults = new();
+    private int _downloadCount = 0;
+
+    public MainService(ILogger<MainService> logger, YoutubeClient youtubeClient)
+    {
+        _logger = logger;
+        _youtubeClient = youtubeClient;
+        _ = ProcessQueueAsync();
+    }
+
+    public async Task<IResult> DoSmth(string[] values)
+    {
+        var taskId = Guid.NewGuid();
+        var queueItem = new QueueItem(taskId, values);
+
+        var currentPosition = Interlocked.Increment(ref _queuedCount);
+
+        lock (_taskResults)
+        {
+            _taskResults[taskId] = new TaskResult
+            {
+                Status = TaskStatus.Queued,
+                QueuedAt = DateTime.UtcNow
+            };
+        }
+
+        await _queue.Writer.WriteAsync(queueItem);
+        _logger.LogInformation("Task {TaskId} added to queue at position {Position} with {Count} values",
+            taskId, currentPosition, values?.Length ?? 0);
+
+        return Results.Ok(new
+        {
+            taskId,
+            status = "queued",
+            queuePosition = currentPosition,
+            queuedAt = DateTime.UtcNow
+        });
+    }
+
+    private async Task ProcessQueueAsync()
+    {
+        await foreach (var item in _queue.Reader.ReadAllAsync())
+        {
+            try
+            {
+                await _semaphore.WaitAsync();
+
+                lock (_taskResults)
+                {
+                    if (_taskResults.TryGetValue(item.TaskId, out var taskResult))
+                    {
+                        taskResult.Status = TaskStatus.Processing;
+                        taskResult.StartedAt = DateTime.UtcNow;
+                    }
+                }
+
+                _logger.LogInformation("Processing task {TaskId} with {Count} playlists",
+                    item.TaskId, item.Values?.Length ?? 0);
+
+                if (item.Values == null || item.Values.Length == 0)
+                {
+                    throw new ArgumentException("Values array is empty");
+                }
+
+                var taskDirectory = Path.Combine(Directory.GetCurrentDirectory(), item.TaskId.ToString());
+                Directory.CreateDirectory(taskDirectory);
+
+                for (int i = 0; i < item.Values.Length; i++)
+                {
+                    var playlistUrl = item.Values[i];
+                    if (string.IsNullOrEmpty(playlistUrl))
+                    {
+                        _logger.LogWarning("Skipping null/empty playlist at index {Index} for task {TaskId}", i, item.TaskId);
+                        continue;
+                    }
+
+                    _logger.LogInformation("Processing playlist {Index}/{Total} for task {TaskId}: {Url}",
+                        i + 1, item.Values.Length, item.TaskId, playlistUrl);
+
+                    await ProcessPlaylist(playlistUrl, taskDirectory);
+                }
+
+                var result = $"Task {item.TaskId} completed successfully with {item.Values?.Length ?? 0} values!";
+
+                lock (_taskResults)
+                {
+                    if (_taskResults.TryGetValue(item.TaskId, out var taskResult))
+                    {
+                        taskResult.Status = TaskStatus.Completed;
+                        taskResult.CompletedAt = DateTime.UtcNow;
+                        taskResult.Message = result;
+                    }
+                }
+
+                item.CompletionSource.SetResult(result);
+                _logger.LogInformation("Task {TaskId} completed", item.TaskId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing task {TaskId}", item.TaskId);
+
+                lock (_taskResults)
+                {
+                    if (_taskResults.TryGetValue(item.TaskId, out var taskResult))
+                    {
+                        taskResult.Status = TaskStatus.Failed;
+                        taskResult.CompletedAt = DateTime.UtcNow;
+                        taskResult.Error = ex.Message;
+                    }
+                }
+
+                item.CompletionSource.SetException(ex);
+            }
+            finally
+            {
+                _semaphore.Release();
+                Interlocked.Decrement(ref _queuedCount);
+            }
+        }
+    }
+
+    private async Task ProcessPlaylist(string playlistUrl, string taskDirectory)
+    {
+        var playlist = await _youtubeClient.Playlists.GetAsync(playlistUrl);
+        
+        var playlistId = playlist.Id.Value;
+
+        var playlistDirectory = Path.Combine(taskDirectory, playlistId);
+        
+        Directory.CreateDirectory(playlistDirectory);
+
+        _logger.LogInformation("Downloading playlist '{Title}' (ID: {PlaylistId}) to {Directory}",
+            playlist.Title, playlistId, playlistDirectory);
+
+        var videos = await _youtubeClient.Playlists.GetVideosAsync(playlistUrl);
+
+        if (videos.Count <= 0)
+        {
+            _logger.LogWarning("Playlist {PlaylistId} is empty", playlistId);
+            return;
+        }
+
+        _logger.LogInformation("Found {Count} videos in playlist {PlaylistId}", videos.Count, playlistId);
+
+        var currentDownloadCount = Interlocked.Increment(ref _downloadCount);
+        
+        if (currentDownloadCount >= 25)
+        {
+            _logger.LogInformation("Rate limit reached ({Count} downloads), waiting 120 seconds", currentDownloadCount);
+            
+            await Task.Delay(TimeSpan.FromSeconds(120));
+            
+            Interlocked.Exchange(ref _downloadCount, 0);
+        }
+
+        var fileCounter = new Dictionary<string, int>();
+
+        foreach (var video in videos)
+        {
+            StreamManifest manifest;
+            try
+            {
+                manifest = await _youtubeClient.Videos.Streams.GetManifestAsync(video.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get manifest for video {VideoId} in playlist {PlaylistId}", video.Id, playlistId);
+                continue;
+            }
+            if (manifest is null) continue;
+
+            IStreamInfo stream;
+            try
+            {
+                stream = manifest.GetAudioOnlyStreams()
+                    .Where(x => x.Container == Container.WebM)
+                    .GetWithHighestBitrate();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get audio stream for video {VideoId} in playlist {PlaylistId}", video.Id, playlistId);
+                continue;
+            }
+
+            if (stream is null) continue;
+
+            var sanitizedTitle = SanitizeFileName(video.Title);
+            
+            if (fileCounter.ContainsKey(sanitizedTitle))
+            {
+                fileCounter[sanitizedTitle]++;
+                sanitizedTitle = $"{sanitizedTitle}_{fileCounter[sanitizedTitle]}";
+            }
+            else
+            {
+                fileCounter[sanitizedTitle] = 0;
+            }
+
+            var path = Path.Combine(playlistDirectory, $"{sanitizedTitle}.{stream.Container}");
+            _logger.LogInformation("Downloading: {Title} -> {FileName}", video.Title, sanitizedTitle);
+
+            try
+            {
+                await _youtubeClient.Videos.Streams.DownloadAsync(stream, path);
+                Interlocked.Increment(ref _downloadCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to download video {VideoId}: {Title}", video.Id, video.Title);
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(10));
+        }
+
+        _logger.LogInformation("Completed downloading playlist {PlaylistId}", playlistId);
+    }
+
+    private static string SanitizeFileName(string fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            return "unnamed";
+        }
+
+        // Replace invalid path characters with underscore
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var sanitized = new StringBuilder(fileName.Length);
+
+        foreach (var c in fileName)
+        {
+            // Keep letters (including Cyrillic, Chinese, etc.), digits, and safe punctuation
+            // Replace invalid file system characters and control characters
+            if (invalidChars.Contains(c) || char.IsControl(c))
+            {
+                sanitized.Append('_');
+            }
+            else if (char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_' || c == '.' ||
+                     c == '(' || c == ')' || c == '[' || c == ']' || c == '\'' || c == ',')
+            {
+                sanitized.Append(c);
+            }
+            else
+            {
+                // Replace other special symbols with underscore
+                sanitized.Append('_');
+            }
+        }
+
+        var result = sanitized.ToString();
+
+        // Replace multiple consecutive underscores with a single underscore
+        result = Regex.Replace(result, "_+", "_");
+
+        // Remove leading/trailing underscores and whitespace
+        result = result.Trim('_', ' ', '.');
+
+        // Handle Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+        var reservedNames = new[] { "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+                                     "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
+                                     "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" };
+
+        if (reservedNames.Contains(result.ToUpperInvariant()))
+        {
+            result = "_" + result;
+        }
+
+        // Ensure the filename is not empty after sanitization
+        if (string.IsNullOrWhiteSpace(result))
+        {
+            result = "unnamed";
+        }
+
+        // Limit filename length to 200 characters (leaving room for extension)
+        if (result.Length > 160)
+        {
+            result = result.Substring(0, 160);
+        }
+
+        return result;
+    }
+
+    public int GetQueueLength() => _queuedCount;
+
+    public TaskResult? GetTaskStatus(Guid taskId)
+    {
+        lock (_taskResults)
+        {
+            return _taskResults.TryGetValue(taskId, out var result) ? result : null;
+        }
+    }
+
+    public (bool exists, string? zipPath) CompressDirectory(Guid taskId)
+    {
+        var directoryPath = Path.Combine(Directory.GetCurrentDirectory(), taskId.ToString());
+
+        if (!Directory.Exists(directoryPath))
+        {
+            _logger.LogWarning("Directory not found for task {TaskId}", taskId);
+            return (false, null);
+        }
+
+        var zipPath = Path.Combine(Directory.GetCurrentDirectory(), $"{taskId}.zip");
+
+        try
+        {
+            if (File.Exists(zipPath))
+            {
+                _logger.LogInformation("Zip file already exists for task {TaskId}, returning existing file", taskId);
+                return (true, zipPath);
+            }
+
+            _logger.LogInformation("Creating zip file for task {TaskId}", taskId);
+            System.IO.Compression.ZipFile.CreateFromDirectory(directoryPath, zipPath);
+            _logger.LogInformation("Zip file created successfully for task {TaskId}", taskId);
+
+            return (true, zipPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error creating zip file for task {TaskId}", taskId);
+            return (false, null);
+        }
+    }
+
+    public void CleanupTask(Guid taskId)
+    {
+        try
+        {
+            // Remove from task results
+            lock (_taskResults)
+            {
+                _taskResults.Remove(taskId);
+            }
+
+            // Delete directory
+            var directoryPath = Path.Combine(Directory.GetCurrentDirectory(), taskId.ToString());
+            if (Directory.Exists(directoryPath))
+            {
+                Directory.Delete(directoryPath, recursive: true);
+                _logger.LogInformation("Deleted directory for task {TaskId}", taskId);
+            }
+
+            // Delete zip file
+            var zipPath = Path.Combine(Directory.GetCurrentDirectory(), $"{taskId}.zip");
+            if (File.Exists(zipPath))
+            {
+                File.Delete(zipPath);
+                _logger.LogInformation("Deleted zip file for task {TaskId}", taskId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error cleaning up task {TaskId}", taskId);
+        }
+    }
+
+    private record QueueItem(Guid TaskId, string[] Values)
+    {
+        public TaskCompletionSource<string> CompletionSource { get; } = new();
+    }
+
+    public class TaskResult
+    {
+        public TaskStatus Status { get; set; }
+        public DateTime QueuedAt { get; set; }
+        public DateTime? StartedAt { get; set; }
+        public DateTime? CompletedAt { get; set; }
+        public string? Message { get; set; }
+        public string? Error { get; set; }
+    }
+
+    public enum TaskStatus
+    {
+        Queued,
+        Processing,
+        Completed,
+        Failed
+    }
+}
