@@ -11,7 +11,7 @@ services:
       - "1000:5000"
     volumes:
       - download-data:/app
-    restart: unless-stopped
+    restart: always
     networks:
       - downloadfy-network
 
@@ -24,7 +24,7 @@ services:
       - "1010:80"
     depends_on:
       - backend
-    restart: unless-stopped
+    restart: always
     networks:
       - downloadfy-network
 
