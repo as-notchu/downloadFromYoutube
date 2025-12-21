@@ -85,6 +85,36 @@ app.MapPost("/do-smth", async (DoSmthRequest request, MainService service) =>
 })
     .WithName("DoSomething");
 
+app.MapPost("/download-video", async (DownloadVideoRequest request, MainService service) =>
+{
+    // Validate request
+    if (request.VideoUrls == null || request.VideoUrls.Length == 0)
+    {
+        return Results.BadRequest(new { error = "VideoUrls array is required and cannot be empty" });
+    }
+
+    if (request.VideoUrls.Length > 10)
+    {
+        return Results.BadRequest(new { error = "Maximum 10 videos per request" });
+    }
+
+    foreach (var url in request.VideoUrls)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return Results.BadRequest(new { error = "Video URLs cannot be empty" });
+        }
+
+        if (!url.Contains("youtube.com") && !url.Contains("youtu.be"))
+        {
+            return Results.BadRequest(new { error = "Only YouTube URLs are supported" });
+        }
+    }
+
+    return await service.DownloadVideos(request.VideoUrls);
+})
+    .WithName("DownloadVideo");
+
 
 app.MapGet("/queue/status", (MainService service) => Results.Ok(new
     {
@@ -162,3 +192,4 @@ app.MapGet("/health", () => Results.Ok(new
 app.Run();
 
 record DoSmthRequest(string[] Values);
+record DownloadVideoRequest(string[] VideoUrls);

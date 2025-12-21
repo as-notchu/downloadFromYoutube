@@ -1,6 +1,8 @@
 ﻿using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
+using FFMpegCore;
+using FFMpegEnums = FFMpegCore.Enums;
 using YoutubeExplode;
 using YoutubeExplode.Common;
 using YoutubeExplode.Videos.Streams;
@@ -27,7 +29,7 @@ public class MainService
     public async Task<IResult> DoSmth(string[] values)
     {
         var taskId = Guid.NewGuid();
-        var queueItem = new QueueItem(taskId, values);
+        var queueItem = new QueueItem(taskId, values, DownloadType.AudioPlaylist);
 
         var currentPosition = Interlocked.Increment(ref _queuedCount);
 
@@ -43,6 +45,35 @@ public class MainService
         await _queue.Writer.WriteAsync(queueItem);
         _logger.LogInformation("Task {TaskId} added to queue at position {Position} with {Count} values",
             taskId, currentPosition, values?.Length ?? 0);
+
+        return Results.Ok(new
+        {
+            taskId,
+            status = "queued",
+            queuePosition = currentPosition,
+            queuedAt = DateTime.UtcNow
+        });
+    }
+
+    public async Task<IResult> DownloadVideos(string[] videoUrls)
+    {
+        var taskId = Guid.NewGuid();
+        var queueItem = new QueueItem(taskId, videoUrls, DownloadType.Video);
+
+        var currentPosition = Interlocked.Increment(ref _queuedCount);
+
+        lock (_taskResults)
+        {
+            _taskResults[taskId] = new TaskResult
+            {
+                Status = TaskStatus.Queued,
+                QueuedAt = DateTime.UtcNow
+            };
+        }
+
+        await _queue.Writer.WriteAsync(queueItem);
+        _logger.LogInformation("Video download task {TaskId} added to queue at position {Position} with {Count} videos",
+            taskId, currentPosition, videoUrls?.Length ?? 0);
 
         return Results.Ok(new
         {
@@ -81,19 +112,27 @@ public class MainService
                 var taskDirectory = Path.Combine(Directory.GetCurrentDirectory(), item.TaskId.ToString());
                 Directory.CreateDirectory(taskDirectory);
 
-                for (int i = 0; i < item.Values.Length; i++)
+                if (item.Type == DownloadType.AudioPlaylist)
                 {
-                    var playlistUrl = item.Values[i];
-                    if (string.IsNullOrEmpty(playlistUrl))
+                    for (int i = 0; i < item.Values.Length; i++)
                     {
-                        _logger.LogWarning("Skipping null/empty playlist at index {Index} for task {TaskId}", i, item.TaskId);
-                        continue;
+                        var playlistUrl = item.Values[i];
+                        if (string.IsNullOrEmpty(playlistUrl))
+                        {
+                            _logger.LogWarning("Skipping null/empty playlist at index {Index} for task {TaskId}", i, item.TaskId);
+                            continue;
+                        }
+
+                        _logger.LogInformation("Processing playlist {Index}/{Total} for task {TaskId}: {Url}",
+                            i + 1, item.Values.Length, item.TaskId, playlistUrl);
+
+                        await ProcessPlaylist(playlistUrl, taskDirectory);
                     }
-
-                    _logger.LogInformation("Processing playlist {Index}/{Total} for task {TaskId}: {Url}",
-                        i + 1, item.Values.Length, item.TaskId, playlistUrl);
-
-                    await ProcessPlaylist(playlistUrl, taskDirectory);
+                }
+                else if (item.Type == DownloadType.Video)
+                {
+                    _logger.LogInformation("Processing {Count} videos for task {TaskId}", item.Values.Length, item.TaskId);
+                    await ProcessVideos(item.Values, taskDirectory);
                 }
 
                 var result = $"Task {item.TaskId} completed successfully with {item.Values?.Length ?? 0} values!";
@@ -188,9 +227,7 @@ public class MainService
             IStreamInfo stream;
             try
             {
-                stream = manifest.GetAudioOnlyStreams()
-                    .Where(x => x.Container == Container.WebM)
-                    .GetWithHighestBitrate();
+                stream = GetAudioStream(manifest);
             }
             catch (Exception ex)
             {
@@ -229,6 +266,184 @@ public class MainService
         }
 
         _logger.LogInformation("Completed downloading playlist {PlaylistId}", playlistId);
+    }
+
+    private async Task ProcessVideos(string[] videoUrls, string taskDirectory)
+    {
+        _logger.LogInformation("Downloading {Count} videos to {Directory}", videoUrls.Length, taskDirectory);
+
+        var fileCounter = new Dictionary<string, int>();
+
+        foreach (var videoUrl in videoUrls)
+        {
+            try
+            {
+                var video = await _youtubeClient.Videos.GetAsync(videoUrl);
+
+                _logger.LogInformation("Processing video: {Title} (ID: {VideoId})", video.Title, video.Id);
+
+                StreamManifest manifest;
+                try
+                {
+                    manifest = await _youtubeClient.Videos.Streams.GetManifestAsync(video.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to get manifest for video {VideoId}", video.Id);
+                    continue;
+                }
+
+                if (manifest is null)
+                {
+                    _logger.LogWarning("Manifest is null for video {VideoId}", video.Id);
+                    continue;
+                }
+
+                IStreamInfo videoStream;
+                IStreamInfo audioStream;
+
+                try
+                {
+                    videoStream = GetVideoStream(manifest);
+                    audioStream = GetAudioStream(manifest);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to get streams for video {VideoId}", video.Id);
+                    continue;
+                }
+
+                if (videoStream is null || audioStream is null)
+                {
+                    _logger.LogWarning("Video or audio stream is null for video {VideoId}", video.Id);
+                    continue;
+                }
+
+                var sanitizedTitle = SanitizeFileName(video.Title);
+
+                if (fileCounter.ContainsKey(sanitizedTitle))
+                {
+                    fileCounter[sanitizedTitle]++;
+                    sanitizedTitle = $"{sanitizedTitle}_{fileCounter[sanitizedTitle]}";
+                }
+                else
+                {
+                    fileCounter[sanitizedTitle] = 0;
+                }
+
+                var videoTempPath = Path.Combine(taskDirectory, $"{sanitizedTitle}_video.{videoStream.Container}");
+                var audioTempPath = Path.Combine(taskDirectory, $"{sanitizedTitle}_audio.{audioStream.Container}");
+                var outputPath = Path.Combine(taskDirectory, $"{sanitizedTitle}.mp4");
+
+                _logger.LogInformation("Downloading video stream: {Title}", video.Title);
+
+                try
+                {
+                    await _youtubeClient.Videos.Streams.DownloadAsync(videoStream, videoTempPath);
+                    Interlocked.Increment(ref _downloadCount);
+                    _logger.LogInformation("Video stream downloaded: {Title}", video.Title);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to download video stream {VideoId}: {Title}", video.Id, video.Title);
+                    continue;
+                }
+
+                _logger.LogInformation("Downloading audio stream: {Title}", video.Title);
+
+                try
+                {
+                    await _youtubeClient.Videos.Streams.DownloadAsync(audioStream, audioTempPath);
+                    Interlocked.Increment(ref _downloadCount);
+                    _logger.LogInformation("Audio stream downloaded: {Title}", video.Title);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to download audio stream {VideoId}: {Title}", video.Id, video.Title);
+
+                    if (File.Exists(videoTempPath))
+                    {
+                        File.Delete(videoTempPath);
+                    }
+                    continue;
+                }
+
+                _logger.LogInformation("Merging video and audio streams: {Title}", video.Title);
+
+                try
+                {
+                    await MergeStreamsAsync(videoTempPath, audioTempPath, outputPath);
+                    _logger.LogInformation("Successfully merged streams: {Title}", video.Title);
+
+                    if (File.Exists(videoTempPath))
+                    {
+                        File.Delete(videoTempPath);
+                        _logger.LogInformation("Deleted temporary video file: {Path}", videoTempPath);
+                    }
+
+                    if (File.Exists(audioTempPath))
+                    {
+                        File.Delete(audioTempPath);
+                        _logger.LogInformation("Deleted temporary audio file: {Path}", audioTempPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to merge streams for video {VideoId}: {Title}", video.Id, video.Title);
+
+                    if (File.Exists(videoTempPath))
+                    {
+                        File.Delete(videoTempPath);
+                    }
+                    if (File.Exists(audioTempPath))
+                    {
+                        File.Delete(audioTempPath);
+                    }
+                    continue;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(10));
+
+                var currentDownloadCount = _downloadCount;
+                if (currentDownloadCount >= 25)
+                {
+                    _logger.LogInformation("Rate limit reached ({Count} downloads), waiting 120 seconds", currentDownloadCount);
+                    await Task.Delay(TimeSpan.FromSeconds(120));
+                    Interlocked.Exchange(ref _downloadCount, 0);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing video URL: {Url}", videoUrl);
+            }
+        }
+
+        _logger.LogInformation("Completed downloading videos");
+    }
+
+    private IStreamInfo GetAudioStream(StreamManifest manifest)
+    {
+        return manifest.GetAudioOnlyStreams()
+            .Where(x => x.Container == Container.WebM)
+            .GetWithHighestBitrate();
+    }
+
+    private IStreamInfo GetVideoStream(StreamManifest manifest)
+    {
+        return manifest.GetVideoOnlyStreams()
+            .Where(x => x.Container == Container.Mp4)
+            .GetWithHighestVideoQuality();
+    }
+
+    private async Task MergeStreamsAsync(string videoPath, string audioPath, string outputPath)
+    {
+        await FFMpegArguments
+            .FromFileInput(videoPath)
+            .AddFileInput(audioPath)
+            .OutputToFile(outputPath, overwrite: true, options => options
+                .CopyChannel(FFMpegEnums.Channel.Video)
+                .WithAudioCodec(FFMpegEnums.AudioCodec.Aac))
+            .ProcessAsynchronously();
     }
 
     private static string SanitizeFileName(string fileName)
@@ -370,7 +585,7 @@ public class MainService
         }
     }
 
-    private record QueueItem(Guid TaskId, string[] Values)
+    private record QueueItem(Guid TaskId, string[] Values, DownloadType Type)
     {
         public TaskCompletionSource<string> CompletionSource { get; } = new();
     }
@@ -391,5 +606,11 @@ public class MainService
         Processing,
         Completed,
         Failed
+    }
+
+    public enum DownloadType
+    {
+        AudioPlaylist,
+        Video
     }
 }

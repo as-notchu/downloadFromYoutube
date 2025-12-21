@@ -15,6 +15,11 @@ RUN dotnet publish "DownloadFY.csproj" -c Release -o /app/publish /p:UseAppHost=
 
 FROM base AS final
 WORKDIR /app
+RUN apt-get update && \
+    apt-get install -y ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=publish /app/publish .
 
 ENV ASPNETCORE_URLS=http://+:5000
