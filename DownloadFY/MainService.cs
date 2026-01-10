@@ -84,6 +84,35 @@ public class MainService
         });
     }
 
+    public async Task<IResult> DownloadSingleAudio(string videoUrl)
+    {
+        var taskId = Guid.NewGuid();
+        var queueItem = new QueueItem(taskId, new[] { videoUrl }, DownloadType.SingleAudio);
+
+        var currentPosition = Interlocked.Increment(ref _queuedCount);
+
+        lock (_taskResults)
+        {
+            _taskResults[taskId] = new TaskResult
+            {
+                Status = TaskStatus.Queued,
+                QueuedAt = DateTime.UtcNow
+            };
+        }
+
+        await _queue.Writer.WriteAsync(queueItem);
+        _logger.LogInformation("Single audio download task {TaskId} added to queue at position {Position}",
+            taskId, currentPosition);
+
+        return Results.Ok(new
+        {
+            taskId,
+            status = "queued",
+            queuePosition = currentPosition,
+            queuedAt = DateTime.UtcNow
+        });
+    }
+
     private async Task ProcessQueueAsync()
     {
         await foreach (var item in _queue.Reader.ReadAllAsync())
@@ -133,6 +162,11 @@ public class MainService
                 {
                     _logger.LogInformation("Processing {Count} videos for task {TaskId}", item.Values.Length, item.TaskId);
                     await ProcessVideos(item.Values, taskDirectory);
+                }
+                else if (item.Type == DownloadType.SingleAudio)
+                {
+                    _logger.LogInformation("Processing single audio for task {TaskId}", item.TaskId);
+                    await ProcessSingleAudio(item.Values[0], taskDirectory);
                 }
 
                 var result = $"Task {item.TaskId} completed successfully with {item.Values?.Length ?? 0} values!";
@@ -417,6 +451,65 @@ public class MainService
         _logger.LogInformation("Completed downloading videos");
     }
 
+    private async Task ProcessSingleAudio(string videoUrl, string taskDirectory)
+    {
+        _logger.LogInformation("Downloading single audio from URL: {Url}", videoUrl);
+
+        try
+        {
+            var video = await _youtubeClient.Videos.GetAsync(videoUrl);
+
+            _logger.LogInformation("Processing video: {Title} (ID: {VideoId})", video.Title, video.Id);
+
+            StreamManifest manifest;
+            try
+            {
+                manifest = await _youtubeClient.Videos.Streams.GetManifestAsync(video.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get manifest for video {VideoId}", video.Id);
+                throw;
+            }
+
+            if (manifest is null)
+            {
+                throw new Exception($"Manifest is null for video {video.Id}");
+            }
+
+            IStreamInfo audioStream;
+            try
+            {
+                audioStream = GetAudioStream(manifest);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get audio stream for video {VideoId}", video.Id);
+                throw;
+            }
+
+            if (audioStream is null)
+            {
+                throw new Exception($"Audio stream is null for video {video.Id}");
+            }
+
+            var sanitizedTitle = SanitizeFileName(video.Title);
+            var outputPath = Path.Combine(taskDirectory, $"{sanitizedTitle}.{audioStream.Container}");
+
+            _logger.LogInformation("Downloading audio: {Title} -> {FileName}", video.Title, sanitizedTitle);
+
+            await _youtubeClient.Videos.Streams.DownloadAsync(audioStream, outputPath);
+            Interlocked.Increment(ref _downloadCount);
+
+            _logger.LogInformation("Successfully downloaded single audio: {Title}", video.Title);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing single audio URL: {Url}", videoUrl);
+            throw;
+        }
+    }
+
     private IStreamInfo GetAudioStream(StreamManifest manifest)
     {
         return manifest.GetAudioOnlyStreams()
@@ -581,6 +674,38 @@ public class MainService
         }
     }
 
+    public (bool exists, string? filePath) GetSingleAudioFile(Guid taskId)
+    {
+        var directoryPath = Path.Combine(Directory.GetCurrentDirectory(), taskId.ToString());
+
+        if (!Directory.Exists(directoryPath))
+        {
+            _logger.LogWarning("Directory not found for task {TaskId}", taskId);
+            return (false, null);
+        }
+
+        try
+        {
+            var files = Directory.GetFiles(directoryPath);
+
+            if (files.Length == 0)
+            {
+                _logger.LogWarning("No files found in directory for task {TaskId}", taskId);
+                return (false, null);
+            }
+
+            // Return the first (and should be only) file
+            var filePath = files[0];
+            _logger.LogInformation("Found single audio file for task {TaskId}: {FilePath}", taskId, filePath);
+            return (true, filePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting single audio file for task {TaskId}", taskId);
+            return (false, null);
+        }
+    }
+
     private record QueueItem(Guid TaskId, string[] Values, DownloadType Type)
     {
         public TaskCompletionSource<string> CompletionSource { get; } = new();
@@ -607,6 +732,7 @@ public class MainService
     public enum DownloadType
     {
         AudioPlaylist,
-        Video
+        Video,
+        SingleAudio
     }
 }
