@@ -207,6 +207,10 @@
                 <input type="radio" id="videosRadio" name="downloadType" value="videos" onchange="updateDownloadType()">
                 <label for="videosRadio">Videos</label>
             </div>
+            <div class="radio-option">
+                <input type="radio" id="singleAudioRadio" name="downloadType" value="singleAudio" onchange="updateDownloadType()">
+                <label for="singleAudioRadio">Single Audio</label>
+            </div>
         </div>
 
         <div class="input-group">
@@ -229,6 +233,8 @@
         // Update UI based on selected download type
         function updateDownloadType() {
             const isPlaylists = document.getElementById('playlistsRadio').checked;
+            const isVideos = document.getElementById('videosRadio').checked;
+            const isSingleAudio = document.getElementById('singleAudioRadio').checked;
             const urlsLabel = document.getElementById('urlsLabel');
             const helpText = document.getElementById('helpText');
             const textarea = document.getElementById('urls');
@@ -237,10 +243,14 @@
                 urlsLabel.textContent = 'YouTube Playlist URLs';
                 helpText.textContent = 'Maximum 10 playlists, separated by spaces';
                 textarea.placeholder = 'Enter YouTube playlist URLs separated by spaces\nExample: https://youtube.com/playlist?list=... https://youtube.com/playlist?list=...';
-            } else {
+            } else if (isVideos) {
                 urlsLabel.textContent = 'YouTube Video URLs';
                 helpText.textContent = 'Maximum 10 videos, separated by spaces';
                 textarea.placeholder = 'Enter YouTube video URLs separated by spaces\nExample: https://youtube.com/watch?v=... https://youtube.com/watch?v=...';
+            } else if (isSingleAudio) {
+                urlsLabel.textContent = 'YouTube Video URL';
+                helpText.textContent = 'Enter a single video URL to download as audio (WebM format)';
+                textarea.placeholder = 'Enter a single YouTube video URL\nExample: https://youtube.com/watch?v=...';
             }
         }
 
@@ -259,6 +269,8 @@
             const statusDiv = document.getElementById('status');
             const submitBtn = document.getElementById('submitBtn');
             const isPlaylists = document.getElementById('playlistsRadio').checked;
+            const isVideos = document.getElementById('videosRadio').checked;
+            const isSingleAudio = document.getElementById('singleAudioRadio').checked;
 
             if (!urlsText) {
                 showStatus('error', `Please enter at least one YouTube ${isPlaylists ? 'playlist' : 'video'} URL`);
@@ -272,7 +284,12 @@
                 return;
             }
 
-            if (urls.length > 10) {
+            if (isSingleAudio && urls.length > 1) {
+                showStatus('error', 'Please enter only one URL for single audio download');
+                return;
+            }
+
+            if (!isSingleAudio && urls.length > 10) {
                 showStatus('error', `Maximum 10 ${isPlaylists ? 'playlists' : 'videos'} allowed`);
                 return;
             }
@@ -281,10 +298,18 @@
             showStatus('info', '<span class="spinner"></span>Submitting request...');
 
             try {
-                const endpoint = isPlaylists ? '/api/do-smth' : '/api/download-video';
-                const requestBody = isPlaylists
-                    ? { values: urls }
-                    : { videoUrls: urls };
+                let endpoint, requestBody;
+
+                if (isSingleAudio) {
+                    endpoint = '/api/download-single-audio';
+                    requestBody = { videoUrl: urls[0] };
+                } else if (isPlaylists) {
+                    endpoint = '/api/do-smth';
+                    requestBody = { values: urls };
+                } else {
+                    endpoint = '/api/download-video';
+                    requestBody = { videoUrls: urls };
+                }
 
                 const response = await fetch(endpoint, {
                     method: 'POST',
@@ -302,6 +327,7 @@
 
                 currentTaskId = data.taskId;
                 localStorage.setItem('currentTaskId', data.taskId);
+                localStorage.setItem('downloadType', isSingleAudio ? 'singleAudio' : 'normal');
                 showStatus('info', `<span class="spinner"></span>Task queued! Position: ${data.queuePosition}<br>Task ID: ${data.taskId}<br>Checking status...`);
 
                 startPolling();
@@ -324,14 +350,20 @@
             if (!currentTaskId) return;
 
             try {
-                const response = await fetch(`/api/data/${currentTaskId}/download`, {
+                const downloadType = localStorage.getItem('downloadType') || 'normal';
+                const downloadEndpoint = downloadType === 'singleAudio'
+                    ? `/api/data/${currentTaskId}/download-single`
+                    : `/api/data/${currentTaskId}/download`;
+
+                const response = await fetch(downloadEndpoint, {
                     method: 'GET'
                 });
 
                 if (response.status === 200) {
                     clearInterval(pollInterval);
                     localStorage.removeItem('currentTaskId');
-                    showStatus('success', `✓ Download ready!<br><button class="download-btn" onclick="downloadFile('${currentTaskId}')">Download ZIP</button>`);
+                    const buttonText = downloadType === 'singleAudio' ? 'Download Audio' : 'Download ZIP';
+                    showStatus('success', `✓ Download ready!<br><button class="download-btn" onclick="downloadFile('${currentTaskId}')">${buttonText}</button>`);
                     document.getElementById('submitBtn').disabled = false;
                 } else if (response.status === 400) {
                     const data = await response.json();
@@ -350,15 +382,31 @@
 
         async function downloadFile(taskId) {
             try {
-                const url = `/api/data/${taskId}/download`;
+                const downloadType = localStorage.getItem('downloadType') || 'normal';
+                const url = downloadType === 'singleAudio'
+                    ? `/api/data/${taskId}/download-single`
+                    : `/api/data/${taskId}/download`;
+
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${taskId}.zip`;
-                
+
                 const response = await fetch(url);
-                
+
                 if (!response.ok) throw new Error('Download failed');
-                
+
+                // Get filename from Content-Disposition header if available
+                const contentDisposition = response.headers.get('Content-Disposition');
+                let fileName = `${taskId}.zip`;
+
+                if (contentDisposition) {
+                    const fileNameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+                    if (fileNameMatch && fileNameMatch[1]) {
+                        fileName = fileNameMatch[1].replace(/['"]/g, '');
+                    }
+                }
+
+                a.download = fileName;
+
                 const blob = await response.blob();
                 const objectUrl = URL.createObjectURL(blob);
                 a.href = objectUrl;
@@ -366,8 +414,9 @@
                 a.click();
                 document.body.removeChild(a);
                 URL.revokeObjectURL(objectUrl);
-                
+
                 localStorage.removeItem('currentTaskId');
+                localStorage.removeItem('downloadType');
                 showStatus('success', '✓ Download started! You can submit a new request.');
             } catch (error) {
                 showStatus('error', `Download error: ${error.message}`);

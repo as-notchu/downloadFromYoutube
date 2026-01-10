@@ -115,6 +115,23 @@ app.MapPost("/download-video", async (DownloadVideoRequest request, MainService 
 })
     .WithName("DownloadVideo");
 
+app.MapPost("/download-single-audio", async (DownloadSingleAudioRequest request, MainService service) =>
+{
+    // Validate request
+    if (string.IsNullOrWhiteSpace(request.VideoUrl))
+    {
+        return Results.BadRequest(new { error = "VideoUrl is required and cannot be empty" });
+    }
+
+    if (!request.VideoUrl.Contains("youtube.com") && !request.VideoUrl.Contains("youtu.be"))
+    {
+        return Results.BadRequest(new { error = "Only YouTube URLs are supported" });
+    }
+
+    return await service.DownloadSingleAudio(request.VideoUrl);
+})
+    .WithName("DownloadSingleAudio");
+
 
 app.MapGet("/queue/status", (MainService service) => Results.Ok(new
     {
@@ -161,6 +178,47 @@ app.MapGet("/data/{id}/download", async (MainService service, Guid id, HttpConte
 })
     .WithName("DownloadTaskResult");
 
+app.MapGet("/data/{id}/download-single", async (MainService service, Guid id, HttpContext context) =>
+{
+    var taskResult = service.GetTaskStatus(id);
+
+    if (taskResult == null)
+    {
+        return Results.NotFound(new { error = "Task not found" });
+    }
+
+    if (taskResult.Status != MainService.TaskStatus.Completed)
+    {
+        return Results.BadRequest(new
+        {
+            error = "Task is not completed yet",
+            currentStatus = taskResult.Status.ToString().ToLower()
+        });
+    }
+
+    var (exists, filePath) = service.GetSingleAudioFile(id);
+
+    if (!exists || filePath == null)
+    {
+        return Results.NotFound(new { error = "Audio file not found" });
+    }
+
+    // Stream the file directly
+    var fileInfo = new FileInfo(filePath);
+    var fileName = Path.GetFileName(filePath);
+    var mimeType = fileName.EndsWith(".webm") ? "audio/webm" : "application/octet-stream";
+
+    context.Response.ContentType = mimeType;
+    context.Response.Headers.ContentDisposition = $"attachment; filename=\"{fileName}\"";
+    context.Response.ContentLength = fileInfo.Length;
+
+    await using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 10 * 1024 * 1024);
+    await fileStream.CopyToAsync(context.Response.Body);
+
+    return Results.Empty;
+})
+    .WithName("DownloadSingleAudio");
+
 app.MapDelete("/data/{id}", (MainService service, Guid id) =>
 {
     var taskResult = service.GetTaskStatus(id);
@@ -193,3 +251,4 @@ app.Run();
 
 record DoSmthRequest(string[] Values);
 record DownloadVideoRequest(string[] VideoUrls);
+record DownloadSingleAudioRequest(string VideoUrl);
