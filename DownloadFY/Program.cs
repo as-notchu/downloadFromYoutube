@@ -217,7 +217,7 @@ app.MapGet("/data/{id}/download-single", async (MainService service, Guid id, Ht
 
     return Results.Empty;
 })
-    .WithName("DownloadSingleAudio");
+    .WithName("SingleAudioTaskStatus");
 
 app.MapDelete("/data/{id}", (MainService service, Guid id) =>
 {
