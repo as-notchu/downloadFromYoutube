@@ -1,4 +1,5 @@
 using DownloadFY;
+using Microsoft.Net.Http.Headers;
 using Microsoft.OpenApi;
 using Microsoft.OpenApi.Models;
 using YoutubeExplode;
@@ -208,8 +209,12 @@ app.MapGet("/data/{id}/download-single", async (MainService service, Guid id, Ht
     var fileName = Path.GetFileName(filePath);
     var mimeType = fileName.EndsWith(".webm") ? "audio/webm" : "application/octet-stream";
 
+    // Use ContentDispositionHeaderValue to properly handle non-ASCII filenames
+    var contentDisposition = new ContentDispositionHeaderValue("attachment");
+    contentDisposition.SetHttpFileName(fileName);
+    Console.WriteLine(contentDisposition.ToString());
     context.Response.ContentType = mimeType;
-    context.Response.Headers.ContentDisposition = $"attachment; filename=\"{fileName}\"";
+    context.Response.Headers[HeaderNames.ContentDisposition] = contentDisposition.ToString();
     context.Response.ContentLength = fileInfo.Length;
 
     await using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 10 * 1024 * 1024);

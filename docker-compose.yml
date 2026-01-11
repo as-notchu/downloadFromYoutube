@@ -9,8 +9,6 @@ services:
       - ASPNETCORE_URLS=http://+:5000
     ports:
       - "1000:5000"
-    volumes:
-      - download-data:/app
     restart: always
     networks:
       - downloadfy-network
